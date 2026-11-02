@@ -61,46 +61,64 @@ def pixelate_simulation(
     exp_path=None,
     boundary_xy=None,
     extent=None,
+    fields=None,
+    x_key="x_vertex",
+    y_key="y_vertex",
 ):
     """
-    Linearly interpolate GHF and Eb onto an (ny, nx) pixel-center grid,
-    then set values outside the supplied polygon to zero.
+    Interpolate vertex fields onto an (ny, nx) pixel-center grid.
 
-    Supply either exp_path or boundary_xy, not both.
+    Values outside the supplied polygon are set to zero.
 
     Parameters
     ----------
-    sim : dict
-        Fields: x_vertex, y_vertex, GHF, Eb.
-        Each field must have one entry per mesh vertex.
+    sim : mapping
+        Mesh coordinates and numeric vertex fields.
     nx, ny : int
         Number of pixels along x and y.
     exp_path : str or Path, optional
         Path to a single-profile .exp boundary file.
+        Supply exactly one of exp_path or boundary_xy.
     boundary_xy : array-like, shape (N, 2), optional
         Ordered boundary coordinates, optionally already closed.
     extent : tuple, optional
         (xmin, xmax, ymin, ymax).
         Defaults to the boundary's bounding box.
+    fields : str or sequence of str, optional
+        Fields to interpolate. If None, automatically select real numeric
+        vectors with one entry per mesh vertex, excluding coordinate keys.
+        MATLAB-style row and column vectors are supported.
+    x_key, y_key : str
+        Keys containing mesh vertex coordinates.
 
     Returns
     -------
     dict
-        GHF, Eb, mask, X, Y : arrays with shape (ny, nx).
-        x, y               : pixel-center coordinates.
-        x_edges, y_edges   : pixel-edge coordinates.
-        boundary_xy        : closed polygon coordinates.
-        extent             : grid bounds.
+        Each selected field : array with shape (ny, nx).
+        mask, X, Y          : arrays with shape (ny, nx).
+        x, y                : pixel-center coordinates.
+        x_edges, y_edges    : pixel-edge coordinates.
+        boundary_xy         : closed polygon coordinates.
+        extent              : grid bounds.
+
+    Notes
+    -----
+    Pixel centers inside the polygon but outside the mesh convex hull
+    receive NaN. Nonfinite source field values can also propagate.
     """
     for name, n in (("nx", nx), ("ny", ny)):
-        if not isinstance(n, (int, np.integer)) or n <= 0:
+        if (
+            isinstance(n, (bool, np.bool_))
+            or not isinstance(n, (int, np.integer))
+            or n <= 0
+        ):
             raise ValueError(f"{name} must be a positive integer.")
 
     if (exp_path is None) == (boundary_xy is None):
         raise ValueError("Supply exactly one of exp_path or boundary_xy.")
 
     if exp_path is not None:
-        boundary = read_exp_boundary(exp_path)
+        boundary = np.asarray(read_exp_boundary(exp_path), dtype=float)
     else:
         boundary = np.asarray(boundary_xy, dtype=float)
 
@@ -108,25 +126,98 @@ def pixelate_simulation(
         boundary.ndim != 2
         or boundary.shape[1] != 2
         or boundary.shape[0] < 3
-        or not np.all(np.isfinite(boundary))
+        or not np.isfinite(boundary).all()
     ):
         raise ValueError("Boundary must be a finite (N, 2) array.")
 
     if not np.array_equal(boundary[0], boundary[-1]):
         boundary = np.vstack((boundary, boundary[0]))
 
-    # Flatten MATLAB-style row/column vectors.
-    x, y, ghf, eb = [
-        np.asarray(sim[field], dtype=float).ravel()
-        for field in ("x_vertex", "y_vertex", "GHF", "Eb")
-    ]
+    # Flatten MATLAB-style row/column coordinate vectors.
+    x = np.asarray(sim[x_key], dtype=float).ravel()
+    y = np.asarray(sim[y_key], dtype=float).ravel()
 
-    if not (x.size == y.size == ghf.size == eb.size):
-        raise ValueError("Coordinates and fields must have the same length.")
-    if x.size < 3 or not np.all(np.isfinite(np.column_stack((x, y)))):
+    if x.size != y.size:
+        raise ValueError("x and y coordinates must have the same length.")
+
+    if x.size < 3 or not (
+        np.isfinite(x).all() and np.isfinite(y).all()
+    ):
         raise ValueError("At least three finite mesh vertices are required.")
 
-    # Use the boundary bounding box for a consistent domain grid.
+    n_vertices = x.size
+
+    def is_vertex_field(value):
+        """Recognize real numeric vectors, including row/column vectors."""
+        try:
+            arr = np.asarray(value)
+        except (TypeError, ValueError):
+            return False
+
+        is_vector = (
+            arr.ndim == 1
+            or (arr.ndim == 2 and 1 in arr.shape)
+        )
+        is_real_numeric = (
+            np.issubdtype(arr.dtype, np.number)
+            and not np.iscomplexobj(arr)
+        )
+
+        return (
+            is_vector
+            and is_real_numeric
+            and arr.size == n_vertices
+        )
+
+    if fields is None:
+        field_names = [
+            name
+            for name, value in sim.items()
+            if name not in (x_key, y_key) and is_vertex_field(value)
+        ]
+    elif isinstance(fields, str):
+        field_names = [fields]
+    else:
+        field_names = list(fields)
+
+    if not field_names:
+        raise ValueError("No vertex fields found or selected.")
+
+    if len(set(field_names)) != len(field_names):
+        raise ValueError("Field names must be unique.")
+
+    # Avoid silently overwriting grid metadata in the returned dictionary.
+    reserved_keys = {
+        "x", "y", "X", "Y", "x_edges", "y_edges",
+        "mask", "boundary_xy", "extent",
+    }
+
+    conflicts = reserved_keys.intersection(field_names)
+    if conflicts:
+        raise ValueError(
+            "Field names conflict with output grid keys: "
+            f"{sorted(conflicts)}. Rename these fields before interpolation."
+        )
+
+    values = []
+    for name in field_names:
+        if name in (x_key, y_key):
+            raise ValueError(f"{name!r} is a coordinate key, not a field.")
+
+        if name not in sim:
+            raise KeyError(f"Field {name!r} is missing from sim.")
+
+        if not is_vertex_field(sim[name]):
+            raise ValueError(
+                f"Field {name!r} must be a real numeric vector "
+                f"with {n_vertices} entries."
+            )
+
+        values.append(np.asarray(sim[name], dtype=float).ravel())
+
+    # Shape: (n_vertices, n_fields).
+    values = np.column_stack(values)
+
     if extent is None:
         extent = (
             boundary[:, 0].min(),
@@ -138,7 +229,7 @@ def pixelate_simulation(
     xmin, xmax, ymin, ymax = map(float, extent)
 
     if not (
-        np.all(np.isfinite([xmin, xmax, ymin, ymax]))
+        np.isfinite([xmin, xmax, ymin, ymax]).all()
         and xmin < xmax
         and ymin < ymax
     ):
@@ -151,39 +242,42 @@ def pixelate_simulation(
     y_grid = (y_edges[:-1] + y_edges[1:]) / 2
     X, Y = np.meshgrid(x_grid, y_grid)
 
-    # Polygon mask: True for pixel centers inside the boundary.
     polygon = PolygonPath(boundary, closed=True)
     mask = polygon.contains_points(
         np.column_stack((X.ravel(), Y.ravel()))
     ).reshape(ny, nx)
 
-    # Interpolate both fields using the same triangulation.
-    points = np.column_stack((x, y))
-    triangulation = Delaunay(points)
-
+    # Reuse one triangulation for all selected fields.
+    triangulation = Delaunay(np.column_stack((x, y)))
     interpolator = LinearNDInterpolator(
         triangulation,
-        np.column_stack((ghf, eb)),
+        values,
         fill_value=np.nan,
     )
 
-    # Initialize everything to zero and evaluate only inside the polygon.
-    fields = np.zeros((ny, nx, 2), dtype=float)
-    fields[mask] = interpolator(X[mask], Y[mask])
+    pixel_fields = np.zeros((ny, nx, len(field_names)), dtype=float)
 
-    return {
+    if mask.any():
+        pixel_fields[mask] = interpolator(X[mask], Y[mask])
+
+    result = {
         "x": x_grid,
         "y": y_grid,
         "X": X,
         "Y": Y,
         "x_edges": x_edges,
         "y_edges": y_edges,
-        "GHF": fields[..., 0],
-        "Eb": fields[..., 1],
         "mask": mask,
         "boundary_xy": boundary,
         "extent": (xmin, xmax, ymin, ymax),
     }
+
+    result.update({
+        name: pixel_fields[..., j]
+        for j, name in enumerate(field_names)
+    })
+
+    return result
 
 
 

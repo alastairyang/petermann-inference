@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+*.mat
+*.ppt
+*.pptx
+*.tif
+*.tiff
+*.nc
+*.npz
+
+/data/simulations.npz
