@@ -16,5 +16,7 @@ wheels/
 *.tiff
 *.nc
 *.npz
+*.npy
 
+/results/
 /data/simulations.npz

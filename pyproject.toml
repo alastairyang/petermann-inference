@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "gmr-inference",
+    "scores>=2.7.0",
 ]
 
 [tool.uv.sources]
