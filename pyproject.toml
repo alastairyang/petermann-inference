@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "gmr-inference",
+    "numba>=0.68.1",
     "scores>=2.7.0",
 ]
 
